@@ -95,12 +95,14 @@ function setStatus(s){ el.locStatus.textContent = s; }
 
 async function apiPost(row){
   const r = await fetch(ENDPOINT_URL, {
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body: JSON.stringify(row),
+    method: 'POST',
+    // HAPUS baris headers berikut:
+    // headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(row)
   });
   return r.json();
 }
+
 async function apiList(nama){
   const url = ENDPOINT_URL + '?action=list&nama=' + encodeURIComponent(nama);
   const r = await fetch(url);
