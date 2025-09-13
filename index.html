@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Absensi Online (HTML + Apps Script)</title>
+<style>
+  :root { --bg:#f8fafc; --card:#fff; --line:#e2e8f0; --text:#0f172a; --muted:#475569; --brand:#4f46e5; }
+  body{font-family:system-ui,Segoe UI,Arial,sans-serif;background:var(--bg);color:var(--text);max-width:760px;margin:24px auto;padding:0 14px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px;margin:12px 0;box-shadow:0 1px 2px rgba(0,0,0,.04)}
+  h1{font-size:1.25rem;margin:.25rem 0 1rem}
+  label{font-size:.9rem;color:var(--muted)}
+  input{width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:10px}
+  .row{display:flex;gap:10px;align-items:center}
+  .row>*{flex:1}
+  button{padding:10px 14px;border-radius:10px;border:0;background:var(--brand);color:#fff;cursor:pointer}
+  button[disabled]{opacity:.5;cursor:not-allowed}
+  small{color:var(--muted)}
+  .pill{display:inline-block;background:#eef2ff;color:#3730a3;border:1px solid #c7d2fe;padding:2px 8px;border-radius:999px;font-size:.75rem}
+  ul{list-style:none;margin:0;padding:0}
+  li{border-bottom:1px dashed var(--line);padding:10px 2px}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+</style>
+</head>
+<body>
+<h1>Absensi Online</h1>
+<div class="card">
+  <div class="row">
+    <div>
+      <label>Nama</label>
+      <input id="nama" placeholder="Nama lengkap">
+    </div>
+    <div style="flex:0 0 auto">
+      <button id="pakai">Gunakan</button>
+    </div>
+  </div>
+  <div style="margin-top:8px"><small id="locStatus">Mengecek lokasi…</small></div>
+  <div class="row" style="margin-top:8px">
+    <button id="absen" disabled>Absen</button>
+    <button id="refresh">Refresh Riwayat</button>
+    <button id="regeo">Refresh Lokasi</button>
+    <button id="export">Export CSV</button>
+  </div>
+  <div style="margin-top:8px"><small class="mono" id="msg"></small></div>
+</div>
+
+<div class="card">
+  <div class="row" style="align-items:baseline">
+    <h3 style="margin:0;flex:0 0 auto">Riwayat (nama ini)</h3>
+    <div style="text-align:right"><span id="summary" class="pill">—</span></div>
+  </div>
+  <ul id="list"></ul>
+</div>
+
+<script>
+/** ========= KONFIGURASI =========
+ * Ganti dengan URL Web App Apps Script bos (Deploy → Web app → URL) */
+const ENDPOINT_URL = '
+https://script.google.com/macros/s/AKfycbwdfaPvzJBwQF_3fef0Gopa8JfHzD6GgUHQkBezEV4eRMOt4VaA-M0s2rkCUvYhmMp6iQ/exec';             // <-- GANTI
+/** Token sederhana (harus sama dengan di Apps Script) */
+const APP_TOKEN    = 'indonesia';         // <-- GANTI
+/** Koordinat & radius kantor (meter) */
+const OFFICE = { lat: -6.480671890901518, lon: 106.8731167368355, radius_m: 50 }; // <-- GANTI bila perlu
+/** ================================= */
+
+const el = {
+  nama: document.getElementById('nama'),
+  pakai: document.getElementById('pakai'),
+  absen: document.getElementById('absen'),
+  refresh: document.getElementById('refresh'),
+  regeo: document.getElementById('regeo'),
+  exportBtn: document.getElementById('export'),
+  msg: document.getElementById('msg'),
+  locStatus: document.getElementById('locStatus'),
+  list: document.getElementById('list'),
+  summary: document.getElementById('summary'),
+};
+
+const LS_NAMA = 'absen_gas_nama';
+let lastPos = null;
+let watchId = null;
+
+function fmt2(n){return String(n).padStart(2,'0');}
+function nowLocalISO(){
+  const d = new Date();
+  const y=d.getFullYear(), m=fmt2(d.getMonth()+1), t=fmt2(d.getDate());
+  const hh=fmt2(d.getHours()), mm=fmt2(d.getMinutes()), ss=fmt2(d.getSeconds());
+  return `${y}-${m}-${t} ${hh}:${mm}:${ss}`;
+}
+function toRad(x){return x*Math.PI/180;}
+function haversine_m(lat1,lon1,lat2,lon2){
+  const R=6371000, dLat=toRad(lat2-lat1), dLon=toRad(lon2-lon1);
+  const a=Math.sin(dLat/2)**2+Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2;
+  return 2*R*Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
+
+function setMsg(s){ el.msg.textContent = s; }
+function setStatus(s){ el.locStatus.textContent = s; }
+
+async function apiPost(row){
+  const r = await fetch(ENDPOINT_URL, {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(row),
+  });
+  return r.json();
+}
+async function apiList(nama){
+  const url = ENDPOINT_URL + '?action=list&nama=' + encodeURIComponent(nama);
+  const r = await fetch(url);
+  return r.json(); // {ok:true, rows:[...]}
+}
+
+function renderList(rows){
+  // rows: [{nama,waktu,lat,lon,jarak_m}, ...], diurutkan oleh server (asc)
+  const my = rows.slice().sort((a,b)=>a.waktu.localeCompare(b.waktu));
+  el.list.innerHTML = '';
+  if(!my.length){ el.summary.textContent='Belum ada data'; return; }
+  const total = my.length;
+  // rekap hari & jam
+  const byDate = {};
+  my.forEach(r=>{
+    const tgl = r.waktu.slice(0,10);
+    (byDate[tgl] ||= []).push(r.waktu.slice(11));
+  });
+  const hari = Object.keys(byDate).length;
+  el.summary.textContent = `Total ${total} • ${hari} hari`;
+
+  my.reverse().forEach(r=>{
+    const li = document.createElement('li');
+    li.innerHTML = `<b>${r.waktu}</b> • ${r.jarak_m} m<br><small class="mono">lat ${r.lat}, lon ${r.lon}</small>`;
+    el.list.appendChild(li);
+  });
+}
+
+function exportCSV(rows){
+  if(!rows || !rows.length){ alert('Belum ada data'); return; }
+  const headers = ['nama','waktu','lat','lon','jarak_m'];
+  const lines = [headers.join(',')];
+  rows.forEach(r=>lines.push([r.nama,r.waktu,r.lat,r.lon,r.jarak_m].join(',')));
+  const blob = new Blob([lines.join('\n')], {type:'text/csv'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'absensi_'+(el.nama.value||'').replace(/\s+/g,'_')+'.csv';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+el.pakai.onclick = async ()=>{
+  const n = (el.nama.value||'').trim();
+  if(!n){ alert('Isi nama dulu'); return; }
+  localStorage.setItem(LS_NAMA, n);
+  setMsg('Nama disimpan. Menarik riwayat…');
+  try{
+    const res = await apiList(n);
+    if(res.ok){ renderList(res.rows||[]); setMsg(''); }
+    else setMsg('Gagal ambil riwayat: '+(res.error||'unknown'));
+  }catch(e){ setMsg('Gagal ambil riwayat: '+e); }
+};
+
+el.refresh.onclick = el.pakai.onclick;
+
+el.regeo.onclick = ()=>{ el.locStatus.textContent = 'Menyegarkan lokasi…'; initGeo(); };
+
+el.absen.onclick = async ()=>{
+  const nama = (el.nama.value||'').trim();
+  if(!nama){ alert('Isi nama dulu'); return; }
+  if(!lastPos){ alert('Lokasi belum siap'); return; }
+  const jarak = Math.round(haversine_m(lastPos.latitude, lastPos.longitude, OFFICE.lat, OFFICE.lon));
+  const acc = Math.round(lastPos.accuracy||0);
+  const allowed = OFFICE.radius_m + Math.min(50, Math.floor(acc/2));
+  if(jarak > allowed){
+    alert(`Terlalu jauh: ${jarak} m (akurasi ±${acc} m). Tunggu GPS stabil atau mendekat.`);
+    return;
+  } m > ${OFFICE.radius_m} m`);
+    return;
+  }
+  const payload = {
+    token: APP_TOKEN,
+    nama,
+    lat: Number(lastPos.latitude.toFixed(6)),
+    lon: Number(lastPos.longitude.toFixed(6)),
+    jarak_client: jarak,
+    waktu_client: nowLocalISO(),
+    office: OFFICE, // server akan validasi ulang
+  };
+  setMsg('Mengirim absen…');
+  try{
+    const res = await apiPost(payload);
+    if(!res.ok){ setMsg('Gagal: '+(res.error||'unknown')); alert('Gagal: '+(res.error||'unknown')); return; }
+    setMsg(`Sukses. Jarak server: ${res.jarak_m} m`);
+    // refresh list
+    const list = await apiList(nama);
+    if(list.ok) renderList(list.rows||[]);
+  }catch(e){ setMsg('Gagal kirim: '+e); }
+};
+
+el.exportBtn.onclick = async ()=>{
+  const n = (el.nama.value||'').trim();
+  if(!n){ alert('Isi nama dulu'); return; }
+  try{
+    const res = await apiList(n);
+    if(res.ok) exportCSV(res.rows||[]);
+    else alert('Gagal ambil data: '+(res.error||'unknown'));
+  }catch(e){ alert('Gagal: '+e); }
+};
+
+
+// ====== GEO: CEPAT DULU, AKURAT KEMUDIAN ======
+function initGeo(){
+  if(!('geolocation' in navigator)){ el.locStatus.textContent = 'Geolocation tidak didukung.'; return; }
+  // 1) Quick: boleh pakai lokasi cache (maks 10 menit), tanpa high-accuracy
+  const quickOpts   = { enableHighAccuracy:false, timeout:5000, maximumAge:600000 };
+  // 2) Precise: high accuracy, tanpa cache
+  const preciseOpts = { enableHighAccuracy:true, timeout:20000, maximumAge:0 };
+
+  navigator.geolocation.getCurrentPosition(pos=>{
+    lastPos = pos.coords;
+    el.absen.disabled = false;
+    el.locStatus.textContent = `Lokasi awal (±${Math.round(pos.coords.accuracy||0)} m)`;
+  }, err=>{
+    el.locStatus.textContent = 'Menunggu GPS… ' + err.message;
+  }, quickOpts);
+
+  if(watchId !== null) navigator.geolocation.clearWatch(watchId);
+  watchId = navigator.geolocation.watchPosition(pos=>{
+    lastPos = pos.coords;
+    el.locStatus.textContent = `Lokasi akurat (±${Math.round(pos.coords.accuracy||0)} m)`;
+  }, err=>{
+    // diamkan; quick fix sudah cukup untuk enable tombol
+  }, preciseOpts);
+}
+initGeo();
+// Auto-isi nama terakhir
+const saved = localStorage.getItem(LS_NAMA)||'';
+if(saved){ el.nama.value = saved; }
+</script>
+</body>
+</html>
